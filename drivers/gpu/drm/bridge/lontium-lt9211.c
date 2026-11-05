@@ -8,6 +8,7 @@
  *   1xDSI -> 1xLVDS
  *
  * Copyright (C) 2022 Marek Vasut <marex@denx.de>
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/bits.h>
@@ -28,23 +29,24 @@
 #include <drm/drm_panel.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 
-#define REG_PAGE_CONTROL 0xff
-#define REG_CHIPID0 0x8100
-#define REG_CHIPID0_VALUE 0x18
-#define REG_CHIPID1 0x8101
-#define REG_CHIPID1_VALUE 0x01
-#define REG_CHIPID2 0x8102
-#define REG_CHIPID2_VALUE 0xe3
+#define REG_PAGE_CONTROL			0xff
+#define REG_CHIPID0				0x8100
+#define REG_CHIPID0_VALUE			0x18
+#define REG_CHIPID1				0x8101
+#define REG_CHIPID1_VALUE			0x01
+#define REG_CHIPID2				0x8102
+#define REG_CHIPID2_VALUE			0xe3
 
 /* LT9211C chip ID values */
-#define REG_CHIPID0_LT9211C_VALUE 0x21
-#define REG_CHIPID1_LT9211C_VALUE 0x03
-#define REG_CHIPID2_LT9211C_VALUE 0xe1
+#define REG_CHIPID0_LT9211C_VALUE		0x21
+#define REG_CHIPID1_LT9211C_VALUE		0x03
+#define REG_CHIPID2_LT9211C_VALUE		0xe1
 
-#define REG_DSI_LANE 0xd000
+#define REG_DSI_LANE				0xd000
 /* DSI lane count - 0 means 4 lanes ; 1, 2, 3 means 1, 2, 3 lanes. */
-#define REG_DSI_LANE_COUNT(n) ((n) & 3)
+#define REG_DSI_LANE_COUNT(n)			((n) & 3)
 
 /* Chip type enum */
 enum lt9211_chip_type {
@@ -52,25 +54,32 @@ enum lt9211_chip_type {
 	LT9211C,
 };
 
-struct lt9211 {
-	struct drm_bridge bridge;
-	struct device *dev;
-	struct regmap *regmap;
-	struct mipi_dsi_device *dsi;
-	struct drm_bridge *panel_bridge;
-	struct gpio_desc *reset_gpio;
-	struct regulator *vccio;
-	bool lvds_dual_link;
-	bool lvds_dual_link_even_odd_swap;
+struct lt9211_chip_data {
+	enum lt9211_chip_type		chip_type;
+	const struct regmap_config	*regmap_config;
+	const char			*dsi_type;
+	unsigned long			dsi_mode_flags;
+};
 
+struct lt9211 {
+	struct drm_bridge		bridge;
+	struct device			*dev;
+	struct regmap			*regmap;
+	struct mipi_dsi_device		*dsi;
+	struct drm_bridge		*panel_bridge;
+	struct gpio_desc		*reset_gpio;
+	struct regulator		*vccio;
+	bool				lvds_dual_link;
+	bool				lvds_dual_link_even_odd_swap;
+	const struct lt9211_chip_data	*chip_data;
 	/* LT9211C specific fields */
-	enum lt9211_chip_type chip_type;
-	struct workqueue_struct *wq;
-	struct delayed_work lt9211_dw;
-	struct drm_display_mode mode;
-	bool bpp24;
-	bool jeida;
-	bool de;
+	struct workqueue_struct		*wq;
+	struct work_struct		lt9211_work;
+	struct drm_crtc			*lt9211c_crtc;
+	struct drm_display_mode	lt9211c_mode;
+	bool				lt9211c_bpp24;
+	bool				lt9211c_jeida;
+	bool				lt9211c_de_high;
 };
 
 static const struct regmap_range lt9211_rw_ranges[] = {
@@ -107,7 +116,7 @@ static const struct regmap_config lt9211_regmap_config = {
 	.val_bits = 8,
 	.rd_table = &lt9211_rw_table,
 	.wr_table = &lt9211_rw_table,
-	.volatile_table = &lt9211_rw_table,
+	.volatile_table	= &lt9211_rw_table,
 	.ranges = &lt9211_range,
 	.num_ranges = 1,
 	.cache_type = REGCACHE_MAPLE,
@@ -151,11 +160,27 @@ static const struct regmap_config lt9211c_regmap_config = {
 	.volatile_table = &lt9211c_rw_table,
 	.ranges = &lt9211c_range,
 	.num_ranges = 1,
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_NONE,
 	.max_register = 0xda00,
 };
 
-static void lt9211_delayed_work_func(struct work_struct *work);
+static const struct lt9211_chip_data lt9211_chip_data = {
+	.chip_type = LT9211,
+	.regmap_config = &lt9211_regmap_config,
+	.dsi_type = "lt9211",
+	.dsi_mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
+		MIPI_DSI_MODE_VIDEO_HSE | MIPI_DSI_MODE_VIDEO_NO_HSA |
+		MIPI_DSI_MODE_VIDEO_NO_HFP | MIPI_DSI_MODE_VIDEO_NO_HBP |
+		MIPI_DSI_MODE_NO_EOT_PACKET,
+};
+
+static const struct lt9211_chip_data lt9211c_chip_data = {
+	.chip_type = LT9211C,
+	.regmap_config = &lt9211c_regmap_config,
+	.dsi_type = "lt9211c",
+	.dsi_mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
+		MIPI_DSI_MODE_LPM,
+};
 
 static struct lt9211 *bridge_to_lt9211(struct drm_bridge *bridge)
 {
@@ -175,6 +200,7 @@ static int lt9211_attach(struct drm_bridge *bridge,
 static int lt9211_read_chipid(struct lt9211 *ctx)
 {
 	u8 chipid[3];
+	bool is_lt9211, is_lt9211c;
 	int ret;
 
 	/* Read Chip ID registers and verify the chip can communicate. */
@@ -184,23 +210,21 @@ static int lt9211_read_chipid(struct lt9211 *ctx)
 		return ret;
 	}
 
-	/* Test for LT9211 Chip ID. */
-	if (chipid[0] == REG_CHIPID0_VALUE && chipid[1] == REG_CHIPID1_VALUE &&
-	    chipid[2] == REG_CHIPID2_VALUE) {
-		dev_dbg(ctx->dev, "Detected LT9211 chip\n");
+	is_lt9211 = chipid[0] == REG_CHIPID0_VALUE && chipid[1] == REG_CHIPID1_VALUE;
+	is_lt9211c = chipid[0] == REG_CHIPID0_LT9211C_VALUE &&
+		     chipid[1] == REG_CHIPID1_LT9211C_VALUE &&
+		     chipid[2] == REG_CHIPID2_LT9211C_VALUE;
+
+	/* Confirm the detected chip matches what the DT compatible requested. */
+	if ((ctx->chip_data->chip_type == LT9211 && is_lt9211) ||
+	    (ctx->chip_data->chip_type == LT9211C && is_lt9211c)) {
+		dev_dbg(ctx->dev, "Detected %s chip\n", ctx->chip_data->dsi_type);
 		return 0;
 	}
 
-	/* Test for LT9211C Chip ID. */
-	if (chipid[0] == REG_CHIPID0_LT9211C_VALUE &&
-	    chipid[1] == REG_CHIPID1_LT9211C_VALUE &&
-	    chipid[2] == REG_CHIPID2_LT9211C_VALUE) {
-		dev_dbg(ctx->dev, "Detected LT9211C chip\n");
-		return 0;
-	}
-
-	dev_err(ctx->dev, "Unknown Chip ID: 0x%02x 0x%02x 0x%02x\n", chipid[0],
-		chipid[1], chipid[2]);
+	dev_err(ctx->dev,
+		"Chip ID 0x%02x 0x%02x 0x%02x does not match compatible '%s'\n",
+		chipid[0], chipid[1], chipid[2], ctx->chip_data->dsi_type);
 	return -EINVAL;
 }
 
@@ -324,9 +348,9 @@ static int lt9211_autodetect_rx(struct lt9211 *ctx,
 	height = (buf[3] << 8) | buf[4];
 	format = buf[2] & 0xf;
 
-	if (format == 0x3) { /* YUV422 16bit */
+	if (format == 0x3) {		/* YUV422 16bit */
 		width /= 2;
-	} else if (format == 0xa) { /* RGB888 24bit */
+	} else if (format == 0xa) {	/* RGB888 24bit */
 		width /= 3;
 	} else {
 		dev_err(ctx->dev, "Unsupported DSI pixel format 0x%01x\n",
@@ -528,368 +552,6 @@ static int lt9211_configure_tx(struct lt9211 *ctx, bool jeida,
 	return 0;
 }
 
-static void lt9211_atomic_enable(struct drm_bridge *bridge,
-				 struct drm_atomic_commit *state)
-{
-	struct lt9211 *ctx = bridge_to_lt9211(bridge);
-	const struct drm_bridge_state *bridge_state;
-	const struct drm_crtc_state *crtc_state;
-	const struct drm_display_mode *mode;
-	struct drm_connector *connector;
-	struct drm_crtc *crtc;
-	bool lvds_format_24bpp;
-	bool lvds_format_jeida;
-	u32 bus_flags;
-	int ret;
-
-	ret = regulator_enable(ctx->vccio);
-	if (ret) {
-		dev_err(ctx->dev, "Failed to enable vccio: %d\n", ret);
-		return;
-	}
-
-	/* Deassert reset */
-	gpiod_set_value(ctx->reset_gpio, 1);
-	usleep_range(20000, 21000); /* Very long post-reset delay. */
-
-	/* Get the LVDS format from the bridge state. */
-	bridge_state = drm_atomic_get_new_bridge_state(state, bridge);
-	bus_flags = bridge_state->output_bus_cfg.flags;
-
-	switch (bridge_state->output_bus_cfg.format) {
-	case MEDIA_BUS_FMT_RGB666_1X7X3_SPWG:
-		lvds_format_24bpp = false;
-		lvds_format_jeida = true;
-		break;
-	case MEDIA_BUS_FMT_RGB888_1X7X4_JEIDA:
-		lvds_format_24bpp = true;
-		lvds_format_jeida = true;
-		break;
-	case MEDIA_BUS_FMT_RGB888_1X7X4_SPWG:
-		lvds_format_24bpp = true;
-		lvds_format_jeida = false;
-		break;
-	default:
-		/*
-		 * Some bridges still don't set the correct
-		 * LVDS bus pixel format, use SPWG24 default
-		 * format until those are fixed.
-		 */
-		lvds_format_24bpp = true;
-		lvds_format_jeida = false;
-		dev_warn(ctx->dev,
-			"Unsupported LVDS bus format 0x%04x, please check output bridge driver. Falling back to SPWG24.\n",
-			bridge_state->output_bus_cfg.format);
-		break;
-	}
-
-	/*
-	 * Retrieve the CRTC adjusted mode. This requires a little dance to go
-	 * from the bridge to the encoder, to the connector and to the CRTC.
-	 */
-	connector = drm_atomic_get_new_connector_for_encoder(state,
-							     bridge->encoder);
-	crtc = drm_atomic_get_new_connector_state(state, connector)->crtc;
-	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
-	mode = &crtc_state->adjusted_mode;
-	ret = lt9211_read_chipid(ctx);
-	if (ret)
-		return;
-
-	if (ctx->chip_type == LT9211C && ctx->wq) {
-		drm_mode_copy(&ctx->mode, mode);
-		/* LT9211C must enable after mipi clock enable */
-		queue_delayed_work(ctx->wq, &ctx->lt9211_dw,
-				   msecs_to_jiffies(100));
-		dev_dbg(ctx->dev, "LT9211C enabled.\n");
-		return;
-	}
-		ret = lt9211_system_init(ctx);
-		if (ret)
-			return;
-
-		ret = lt9211_configure_rx(ctx);
-		if (ret)
-			return;
-
-		ret = lt9211_autodetect_rx(ctx, mode);
-		if (ret)
-			return;
-
-		ret = lt9211_configure_timing(ctx, mode);
-		if (ret)
-			return;
-
-		ret = lt9211_configure_plls(ctx, mode);
-		if (ret)
-			return;
-
-	ret = lt9211_configure_tx(ctx, lvds_format_jeida, lvds_format_24bpp,
-					  bus_flags & DRM_BUS_FLAG_DE_HIGH);
-		if (ret)
-			return;
-
-	dev_dbg(ctx->dev, "LT9211 enabled.\n");
-}
-
-static void lt9211_atomic_disable(struct drm_bridge *bridge,
-				  struct drm_atomic_commit *state)
-{
-	struct lt9211 *ctx = bridge_to_lt9211(bridge);
-	int ret;
-
-	/*
-	 * Put the chip in reset, pull nRST line low,
-	 * and assure lengthy 10ms reset low timing.
-	 */
-	gpiod_set_value(ctx->reset_gpio, 0);
-	usleep_range(10000, 11000); /* Very long reset duration. */
-
-	ret = regulator_disable(ctx->vccio);
-	if (ret)
-		dev_err(ctx->dev, "Failed to disable vccio: %d\n", ret);
-
-	regcache_mark_dirty(ctx->regmap);
-}
-
-static enum drm_mode_status
-lt9211_mode_valid(struct drm_bridge *bridge,
-		  const struct drm_display_info *info,
-		  const struct drm_display_mode *mode)
-{
-	/* LVDS output clock range 25..176 MHz */
-	if (mode->clock < 25000)
-		return MODE_CLOCK_LOW;
-	if (mode->clock > 176000)
-		return MODE_CLOCK_HIGH;
-
-	return MODE_OK;
-}
-
-#define MAX_INPUT_SEL_FORMATS 1
-
-static u32 *
-lt9211_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
-				 struct drm_bridge_state *bridge_state,
-				 struct drm_crtc_state *crtc_state,
-				 struct drm_connector_state *conn_state,
-				 u32 output_fmt,
-				 unsigned int *num_input_fmts)
-{
-	u32 *input_fmts;
-
-	*num_input_fmts = 0;
-
-	input_fmts = kcalloc(MAX_INPUT_SEL_FORMATS, sizeof(*input_fmts),
-			     GFP_KERNEL);
-	if (!input_fmts)
-		return NULL;
-
-	/* This is the DSI-end bus format */
-	input_fmts[0] = MEDIA_BUS_FMT_RGB888_1X24;
-	*num_input_fmts = 1;
-
-	return input_fmts;
-}
-
-static const struct drm_bridge_funcs lt9211_funcs = {
-	.attach = lt9211_attach,
-	.mode_valid = lt9211_mode_valid,
-	.atomic_enable = lt9211_atomic_enable,
-	.atomic_disable = lt9211_atomic_disable,
-	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
-	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_get_input_bus_fmts = lt9211_atomic_get_input_bus_fmts,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
-};
-
-static int lt9211_parse_dt(struct lt9211 *ctx)
-{
-	struct device_node *port2, *port3;
-	struct drm_bridge *panel_bridge;
-	struct device *dev = ctx->dev;
-	struct drm_panel *panel;
-	int dual_link;
-	int ret;
-
-	ctx->vccio = devm_regulator_get(dev, "vccio");
-	if (IS_ERR(ctx->vccio))
-		return dev_err_probe(dev, PTR_ERR(ctx->vccio),
-				     "Failed to get supply 'vccio'\n");
-
-	ctx->lvds_dual_link = false;
-	ctx->lvds_dual_link_even_odd_swap = false;
-
-	port2 = of_graph_get_port_by_id(dev->of_node, 2);
-	port3 = of_graph_get_port_by_id(dev->of_node, 3);
-	dual_link = drm_of_lvds_get_dual_link_pixel_order(port2, port3);
-	of_node_put(port2);
-	of_node_put(port3);
-
-	if (dual_link == DRM_LVDS_DUAL_LINK_ODD_EVEN_PIXELS) {
-		ctx->lvds_dual_link = true;
-		/* Odd pixels to LVDS Channel A, even pixels to B */
-		ctx->lvds_dual_link_even_odd_swap = false;
-	} else if (dual_link == DRM_LVDS_DUAL_LINK_EVEN_ODD_PIXELS) {
-		ctx->lvds_dual_link = true;
-		/* Even pixels to LVDS Channel A, odd pixels to B */
-		ctx->lvds_dual_link_even_odd_swap = true;
-	}
-
-	ret = drm_of_find_panel_or_bridge(dev->of_node, 2, 0, &panel, &panel_bridge);
-	if (ret < 0)
-		return ret;
-	if (panel) {
-		panel_bridge = devm_drm_panel_bridge_add(dev, panel);
-		if (IS_ERR(panel_bridge))
-			return PTR_ERR(panel_bridge);
-	}
-
-	ctx->panel_bridge = panel_bridge;
-
-	return 0;
-}
-
-static int lt9211_host_attach(struct lt9211 *ctx)
-{
-	struct device *dev = ctx->dev;
-	struct device_node *host_node;
-	struct device_node *endpoint;
-	struct mipi_dsi_device *dsi;
-	struct mipi_dsi_host *host;
-	int dsi_lanes;
-	int ret;
-
-	/* Check if the compatible string matches lt9211c */
-
-	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, -1);
-	dsi_lanes = drm_of_get_data_lanes_count(endpoint, 1, 4);
-	host_node = of_graph_get_remote_port_parent(endpoint);
-	host = of_find_mipi_dsi_host_by_node(host_node);
-	of_node_put(host_node);
-	of_node_put(endpoint);
-
-	if (!host)
-		return -EPROBE_DEFER;
-
-	if (dsi_lanes < 0)
-		return dsi_lanes;
-
-	if (ctx->chip_type == LT9211C) {
-		const struct mipi_dsi_device_info info = {
-			.type = "lt9211c",
-			.channel = 0,
-			.node = NULL,
-		};
-		dsi = devm_mipi_dsi_device_register_full(dev, host, &info);
-	} else {
-		const struct mipi_dsi_device_info info = {
-			.type = "lt9211",
-			.channel = 0,
-			.node = NULL,
-		};
-		dsi = devm_mipi_dsi_device_register_full(dev, host, &info);
-	}
-
-	if (IS_ERR(dsi))
-		return dev_err_probe(dev, PTR_ERR(dsi),
-				     "failed to create dsi device\n");
-
-	ctx->dsi = dsi;
-
-	dsi->lanes = dsi_lanes;
-	dsi->format = MIPI_DSI_FMT_RGB888;
-
-	if (ctx->chip_type == LT9211C) {
-		dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_LPM;
-	} else {
-		dsi->mode_flags =
-			MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
-			MIPI_DSI_MODE_VIDEO_HSE | MIPI_DSI_MODE_VIDEO_NO_HSA |
-			MIPI_DSI_MODE_VIDEO_NO_HFP | MIPI_DSI_MODE_VIDEO_NO_HBP |
-			MIPI_DSI_MODE_NO_EOT_PACKET;
-	}
-
-	ret = devm_mipi_dsi_attach(dev, dsi);
-	if (ret < 0) {
-		dev_err(dev, "failed to attach dsi to host: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static int lt9211_probe(struct i2c_client *client)
-{
-	struct device *dev = &client->dev;
-	struct lt9211 *ctx;
-	int ret;
-
-	ctx = devm_drm_bridge_alloc(dev, struct lt9211, bridge, &lt9211_funcs);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ctx->dev = dev;
-	ctx->chip_type = LT9211;
-
-	/*
-	 * Put the chip in reset, pull nRST line low,
-	 * and assure lengthy 10ms reset low timing.
-	 */
-	ctx->reset_gpio = devm_gpiod_get_optional(ctx->dev, "reset",
-						  GPIOD_OUT_LOW);
-	if (IS_ERR(ctx->reset_gpio))
-		return PTR_ERR(ctx->reset_gpio);
-
-	usleep_range(10000, 11000); /* Very long reset duration. */
-
-	ret = lt9211_parse_dt(ctx);
-
-	if (ret)
-		return ret;
-
-	if (of_device_is_compatible(dev->of_node, "lontium,lt9211c")) {
-		ctx->chip_type = LT9211C;
-		ctx->regmap =
-			devm_regmap_init_i2c(client, &lt9211c_regmap_config);
-	} else {
-		ctx->chip_type = LT9211;
-		ctx->regmap =
-			devm_regmap_init_i2c(client, &lt9211_regmap_config);
-	}
-	if (IS_ERR(ctx->regmap))
-		return PTR_ERR(ctx->regmap);
-
-	/* Initialize LT9211C-specific fields */
-	ctx->wq = create_workqueue("lt9211_work");
-	if (!ctx->wq)
-		return -ENOMEM;
-
-	INIT_DELAYED_WORK(&ctx->lt9211_dw, lt9211_delayed_work_func);
-
-	dev_set_drvdata(dev, ctx);
-	i2c_set_clientdata(client, ctx);
-
-	ctx->bridge.of_node = dev->of_node;
-	drm_bridge_add(&ctx->bridge);
-
-	ret = lt9211_host_attach(ctx);
-	if (ret)
-		drm_bridge_remove(&ctx->bridge);
-
-	return ret;
-}
-
-static void lt9211_remove(struct i2c_client *client)
-{
-	struct lt9211 *ctx = i2c_get_clientdata(client);
-
-	if (ctx->wq)
-		destroy_workqueue(ctx->wq);
-
-	drm_bridge_remove(&ctx->bridge);
-}
-
 static int lt9211c_configure_rx(struct lt9211 *ctx)
 {
 	unsigned int pval;
@@ -949,24 +611,26 @@ static int lt9211c_configure_rx(struct lt9211 *ctx)
 
 	ret = regmap_multi_reg_write(ctx->regmap, lt9211c_rx_phy_seq,
 				     ARRAY_SIZE(lt9211c_rx_phy_seq));
-	if (ret)
+	if (ret) {
+		dev_err(ctx->dev, "RX: phy_seq write failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = regmap_multi_reg_write(ctx->regmap, lt9211c_rx_phy_reset_seq,
 				     ARRAY_SIZE(lt9211c_rx_phy_reset_seq));
-	if (ret)
+	if (ret) {
+		dev_err(ctx->dev, "RX: phy_reset_seq write failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = regmap_multi_reg_write(ctx->regmap, lt9211c_rx_clk_sel_seq,
 				     ARRAY_SIZE(lt9211c_rx_clk_sel_seq));
-	if (ret)
+	if (ret) {
+		dev_err(ctx->dev, "RX: clk_sel_seq write failed: %d\n", ret);
 		return ret;
+	}
 
-	ret = regmap_read(ctx->regmap, 0x8180, &pval);
-	if (ret)
-		return ret;
-
-	ret = regmap_write(ctx->regmap, 0x8180, (pval & 0xfc | 0x03));
+	ret = regmap_write_bits(ctx->regmap, 0x8180, 0x3, 0x3);
 	if (ret)
 		return ret;
 
@@ -982,23 +646,23 @@ static int lt9211c_configure_rx(struct lt9211 *ctx)
 	if (ret)
 		return ret;
 
-	ret = regmap_read(ctx->regmap, 0x8530, &pval);
-	if (ret)
-		return ret;
-
-	ret = regmap_write(ctx->regmap, 0x8530, (pval & 0xf8 | 0x11));
+	ret = regmap_write_bits(ctx->regmap, 0x8530, 0x17, 0x11);
 	if (ret)
 		return ret;
 
 	ret = regmap_multi_reg_write(ctx->regmap, lt9211c_rx_input_sel_seq,
 				     ARRAY_SIZE(lt9211c_rx_input_sel_seq));
-	if (ret)
+	if (ret) {
+		dev_err(ctx->dev, "RX: input_sel_seq write failed: %d\n", ret);
 		return ret;
+	}
 
 	ret = regmap_multi_reg_write(ctx->regmap, lt9211c_rx_dig_seq,
 				     ARRAY_SIZE(lt9211c_rx_dig_seq));
-	if (ret)
+	if (ret) {
+		dev_err(ctx->dev, "RX: dig_seq write failed: %d\n", ret);
 		return ret;
+	}
 
 	/* Give the chip time to lock onto RX stream. */
 	msleep(100);
@@ -1012,25 +676,28 @@ static int lt9211c_autodetect_rx(struct lt9211 *ctx,
 	u16 width, height;
 	u8 buf[5];
 	u8 format;
-	u8 bc[3];
 	u8 sot[8];
+	u8 hs_settle;
 	int ret;
 
 	/* Read the SOT from the chip. */
 	ret = regmap_bulk_read(ctx->regmap, 0xd088, sot, sizeof(sot));
+	if (ret) {
+		dev_err(ctx->dev, "RX: failed to read SOT (0xd088): %d\n", ret);
+		return ret;
+	}
+
+	dev_dbg(ctx->dev, "Sot Num = 0x%02x, 0x%02x, 0x%02x, 0x%02x\n",
+		sot[0], sot[2], sot[4], sot[6]);
+
+	dev_dbg(ctx->dev, "Sot Data = 0x%02x, 0x%02x, 0x%02x, 0x%02x\n",
+		sot[1], sot[3], sot[5], sot[7]);
+
+	/* HS Settle Set */
+	hs_settle = (sot[0] > 0x10 && sot[0] < 0x50) ? sot[0] - 5 : 0x08;
+	ret = regmap_write(ctx->regmap, 0xd002, hs_settle);
 	if (ret)
 		return ret;
-
-	dev_dbg(ctx->dev, "Sot Num = 0x%02x, 0x%02x, 0x%02x, 0x%02x\n", sot[0],
-		sot[2], sot[4], sot[6]);
-
-	dev_dbg(ctx->dev, "Sot Data = 0x%02x, 0x%02x, 0x%02x, 0x%02x\n", sot[1],
-		sot[3], sot[5], sot[7]);
-	/* HS Settle Set */
-	if (sot[0] > 0x10 && sot[0] < 0x50)
-		regmap_write(ctx->regmap, 0xd002, sot[0] - 5);
-	else
-		regmap_write(ctx->regmap, 0xd002, 0x08);
 
 	/* Width/Height/Format Auto-detection */
 	ret = regmap_bulk_read(ctx->regmap, 0xd082, buf, sizeof(buf));
@@ -1046,7 +713,9 @@ static int lt9211c_autodetect_rx(struct lt9211 *ctx,
 	} else if (format == 0xa) { /* RGB888 24bit */
 		width /= 3;
 	} else {
-		dev_err(ctx->dev, "Unsupported DSI format 0x%01x\n", format);
+		dev_err(ctx->dev,
+			"Unsupported DSI format 0x%01x (0xd082=%02x %02x %02x %02x %02x)\n",
+			format, buf[0], buf[1], buf[2], buf[3], buf[4]);
 		return -EINVAL;
 	}
 
@@ -1065,32 +734,21 @@ static int lt9211c_autodetect_rx(struct lt9211 *ctx,
 	}
 
 	dev_dbg(ctx->dev, "RX: %dx%d format=0x%01x\n", width, height, format);
+
 	return 0;
 }
 
 static int lt9211c_configure_timing(struct lt9211 *ctx,
 				    const struct drm_display_mode *mode)
 {
-	const struct reg_sequence lt9211c_timing[] = {
-		{ 0xd00d, (mode->vtotal >> 8) & 0xff },
-		{ 0xd00e, mode->vtotal & 0xff },
-		{ 0xd00f, (mode->vdisplay >> 8) & 0xff },
-		{ 0xd010, mode->vdisplay & 0xff },
-		{ 0xd011, (mode->htotal >> 8) & 0xff },
-		{ 0xd012, mode->htotal & 0xff },
-		{ 0xd013, (mode->hdisplay >> 8) & 0xff },
-		{ 0xd014, mode->hdisplay & 0xff },
-		{ 0xd015, (mode->vsync_end - mode->vsync_start) & 0xff },
-		{ 0xd04c, ((mode->hsync_end - mode->hsync_start) >> 8) & 0xff },
-		{ 0xd016, (mode->hsync_end - mode->hsync_start) & 0xff },
-		{ 0xd017, ((mode->vsync_start - mode->vdisplay) >> 8) & 0xff },
-		{ 0xd018, (mode->vsync_start - mode->vdisplay) & 0xff },
-		{ 0xd019, ((mode->hsync_start - mode->hdisplay) >> 8) & 0xff },
-		{ 0xd01a, (mode->hsync_start - mode->hdisplay) & 0xff },
-	};
+	int ret;
 
-	return regmap_multi_reg_write(ctx->regmap, lt9211c_timing,
-				      ARRAY_SIZE(lt9211c_timing));
+	ret = lt9211_configure_timing(ctx, mode);
+	if (ret < 0)
+		return ret;
+
+	return regmap_write(ctx->regmap, 0xd04c,
+			    ((mode->hsync_end - mode->hsync_start) >> 8) & 0xff);
 }
 
 static int lt9211c_configure_plls(struct lt9211 *ctx,
@@ -1118,7 +776,7 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 		{ 0xd040, 0x08 },
 		{ 0xd041, 0x10 },
 		{ 0xd042, 0x20 },
-		{ 0xd02b, 0xA0 },
+		{ 0xd02b, 0xa0 },
 	};
 
 	const struct reg_sequence lt9211c_pcr_reset_seq[] = {
@@ -1129,6 +787,7 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 	};
 
 	unsigned int pval;
+	unsigned int val;
 	int ret;
 	u8 div;
 	u32 pcr_m;
@@ -1146,11 +805,7 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 	if (ret)
 		return ret;
 
-	if (mode->clock < 22000) {
-		ret = regmap_write(ctx->regmap, 0x822f, 0x07);
-		ret |= regmap_write(ctx->regmap, 0x822c, 0x01);
-		div = 16;
-	} else if (mode->clock < 44000) {
+	if (mode->clock < 44000) {
 		ret = regmap_write(ctx->regmap, 0x822f, 0x07);
 		div = 16;
 	} else if (mode->clock < 88000) {
@@ -1164,6 +819,10 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 		div = 2;
 	}
 
+	if (ret)
+		return ret;
+
+	ret = regmap_write(ctx->regmap, 0x822c, mode->clock < 22000 ? 0x01 : 0x00);
 	if (ret)
 		return ret;
 
@@ -1181,7 +840,7 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 		return ret;
 
 	/* 0xd026: pcr_m */
-	ret = regmap_write(ctx->regmap, 0xd026, (0x80 | (u8)pcr_m) & 0x7f);
+	ret = regmap_write(ctx->regmap, 0xd026, (u8)pcr_m & 0x7f);
 	if (ret < 0)
 		return ret;
 
@@ -1218,15 +877,17 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 	if (ret)
 		return ret;
 
-	if (mode->clock < 44000) {
-		ret = regmap_write(ctx->regmap, 0xd00c, 0x60);
-		ret |= regmap_write(ctx->regmap, 0xd01b, 0x00);
-		ret |= regmap_write(ctx->regmap, 0xd01c, 0x60);
-	} else {
-		ret = regmap_write(ctx->regmap, 0xd00c, 0x40);
-		ret |= regmap_write(ctx->regmap, 0xd01b, 0x00);
-		ret |= regmap_write(ctx->regmap, 0xd01c, 0x40);
-	}
+	if (mode->clock < 44000)
+		val = 0x60;
+	else
+		val = 0x40;
+	ret = regmap_write(ctx->regmap, 0xd00c, val);
+	if (ret)
+		return ret;
+	ret = regmap_write(ctx->regmap, 0xd01b, 0x00);
+	if (ret)
+		return ret;
+	ret = regmap_write(ctx->regmap, 0xd01c, val);
 	if (ret)
 		return ret;
 
@@ -1261,8 +922,8 @@ static int lt9211c_configure_plls(struct lt9211 *ctx,
 	return ret;
 }
 
-static int lt9211c_configure_tx(struct lt9211 *ctx,
-				const struct drm_display_mode *mode)
+static int lt9211c_configure_tx(struct lt9211 *ctx, bool jeida, bool bpp24,
+				bool de, const struct drm_display_mode *mode)
 {
 	const struct reg_sequence lt9211c_tx_phy_off_seq[] = {
 		{ 0x8236, 0x00 },
@@ -1314,10 +975,10 @@ static int lt9211c_configure_tx(struct lt9211 *ctx,
 		{ 0x8556, 0x20 },
 
 		{ 0x8568, 0x00 },
-		{ 0x856e, 0x10 | (ctx->de ? BIT(6) : 0) },
-		{ 0x856f, 0x81 | (ctx->jeida ? BIT(6) : 0) |
+		{ 0x856e, 0x10 | (de ? BIT(6) : 0) },
+		{ 0x856f, 0x81 | (jeida ? BIT(6) : 0) |
 				  (ctx->lvds_dual_link ? BIT(4) : 0) |
-				  (ctx->bpp24 ? BIT(2) : 0) },
+				  (bpp24 ? BIT(2) : 0) },
 	};
 
 	const struct reg_sequence lt9211c_tx_ssc_seq[] = {
@@ -1328,11 +989,11 @@ static int lt9211c_configure_tx(struct lt9211 *ctx,
 		{ 0x8717, 0x02 },
 		{ 0x8718, 0x04 },
 		{ 0x8719, 0xd4 },
-		{ 0x871A, 0x00 },
-		{ 0x871B, 0x12 },
-		{ 0x871C, 0x00 },
-		{ 0x871D, 0x24 },
-		{ 0x871F, 0x1c },
+		{ 0x871a, 0x00 },
+		{ 0x871b, 0x12 },
+		{ 0x871c, 0x00 },
+		{ 0x871d, 0x24 },
+		{ 0x871f, 0x1c },
 		{ 0x8720, 0x00 },
 		{ 0x8721, 0x00 },
 		{ 0x871e, 0x02 },
@@ -1357,21 +1018,17 @@ static int lt9211c_configure_tx(struct lt9211 *ctx,
 	u8 sericlk_div;
 	u8 val;
 
-	dev_info(ctx->dev,
-		 "dual_link=%d,even_odd_swap=%d,bpp24=%d,jeida=%d,de=%d\n",
-		 ctx->lvds_dual_link, ctx->lvds_dual_link_even_odd_swap,
-		 ctx->bpp24, ctx->jeida, ctx->de);
+	dev_dbg(ctx->dev,
+		"dual_link=%d,even_odd_swap=%d,bpp24=%d,jeida=%d,de=%d\n",
+		ctx->lvds_dual_link, ctx->lvds_dual_link_even_odd_swap,
+		bpp24, jeida, de);
 
 	ret = regmap_multi_reg_write(ctx->regmap, lt9211c_tx_phy_off_seq,
 				     ARRAY_SIZE(lt9211c_tx_phy_off_seq));
 	if (ret)
 		return ret;
 
-	ret = regmap_read(ctx->regmap, 0x8530, &pval);
-	if (ret)
-		return ret;
-
-	ret = regmap_write(ctx->regmap, 0x8530, (pval & 0x3f | 0x40));
+	ret = regmap_write_bits(ctx->regmap, 0x8530, 0xc0, 0x40);
 	if (ret)
 		return ret;
 
@@ -1386,10 +1043,7 @@ static int lt9211c_configure_tx(struct lt9211 *ctx,
 		phy_clk = (u32)(mode->clock * 7);
 
 	/* 0x8231: prediv sel */
-	if (mode->clock < 20000) {
-		val = 0x28;
-		pre_div = 1;
-	} else if (mode->clock < 40000) {
+	if (mode->clock < 40000) {
 		val = 0x28;
 		pre_div = 1;
 	} else if (mode->clock < 80000) {
@@ -1430,7 +1084,8 @@ static int lt9211c_configure_tx(struct lt9211 *ctx,
 	if (ret < 0)
 		return ret;
 
-	/* 0x8233: pix_mux sel & pix_div sel
+	/*
+	 * 0x8233: pix_mux sel & pix_div sel
 	 * To avoid floating point operations, The pixclk_div is enlarged by 10 times
 	 */
 	if (mode->clock > 150000) {
@@ -1502,57 +1157,411 @@ static int lt9211c_configure_tx(struct lt9211 *ctx,
 	return 0;
 }
 
-static void lt9211_delayed_work_func(struct work_struct *work)
+static void lt9211_work_func(struct work_struct *work)
 {
-	struct delayed_work *dw = to_delayed_work(work);
-	struct lt9211 *ctx = container_of(dw, struct lt9211, lt9211_dw);
+	struct lt9211 *ctx = container_of(work, struct lt9211, lt9211_work);
+	const struct drm_display_mode *mode = &ctx->lt9211c_mode;
 	int ret;
-	const struct drm_display_mode *mode = &ctx->mode;
 
-	/* For LT9211C */
-	if (ctx->chip_type != LT9211C) {
-		dev_err(ctx->dev, "LT9211: Delayed work called for non-LT9211C chip\n");
+	/* wait for vblank irq to correctly configure bridge and autodetect stream */
+	ret = drm_crtc_wait_one_vblank(ctx->lt9211c_crtc);
+	if (ret) {
+		dev_err(ctx->dev, "LT9211C: wait for vblank failed: %d\n", ret);
 		return;
 	}
-		ret = lt9211c_configure_rx(ctx);
-		if (ret)
-			return;
 
-		ret = lt9211c_autodetect_rx(ctx, mode);
-		if (ret)
-			return;
+	ret = lt9211c_configure_rx(ctx);
+	if (ret) {
+		dev_err(ctx->dev, "LT9211C: configure_rx failed: %d\n", ret);
+		return;
+	}
 
-		ret = lt9211c_configure_timing(ctx, mode);
-		if (ret)
-			return;
+	ret = lt9211c_autodetect_rx(ctx, mode);
+	if (ret) {
+		dev_err(ctx->dev, "LT9211C: autodetect_rx failed: %d\n", ret);
+		return;
+	}
 
-		ret = lt9211c_configure_plls(ctx, mode);
-		if (ret)
-			return;
+	ret = lt9211c_configure_timing(ctx, mode);
+	if (ret) {
+		dev_err(ctx->dev, "LT9211C: configure_timing failed: %d\n", ret);
+		return;
+	}
 
-		ret = lt9211c_configure_tx(ctx, mode);
-		if (ret)
-			return;
+	ret = lt9211c_configure_plls(ctx, mode);
+	if (ret) {
+		dev_err(ctx->dev, "LT9211C: configure_plls failed: %d\n", ret);
+		return;
+	}
 
+	ret = lt9211c_configure_tx(ctx, ctx->lt9211c_jeida, ctx->lt9211c_bpp24,
+				   ctx->lt9211c_de_high, mode);
+	if (ret) {
+		dev_err(ctx->dev, "LT9211C: configure_tx failed: %d\n", ret);
+		return;
+	}
+}
+
+static void lt9211_atomic_enable(struct drm_bridge *bridge,
+				 struct drm_atomic_commit *state)
+{
+	struct lt9211 *ctx = bridge_to_lt9211(bridge);
+	const struct drm_bridge_state *bridge_state;
+	const struct drm_crtc_state *crtc_state;
+	const struct drm_display_mode *mode;
+	struct drm_connector *connector;
+	struct drm_crtc *crtc;
+	bool lvds_format_24bpp;
+	bool lvds_format_jeida;
+	u32 bus_flags;
+	int ret;
+
+	ret = regulator_enable(ctx->vccio);
+	if (ret) {
+		dev_err(ctx->dev, "Failed to enable vccio: %d\n", ret);
+		return;
+	}
+
+	/* Deassert reset */
+	gpiod_set_value(ctx->reset_gpio, 1);
+	usleep_range(20000, 21000);	/* Very long post-reset delay. */
+
+	/* Get the LVDS format from the bridge state. */
+	bridge_state = drm_atomic_get_new_bridge_state(state, bridge);
+	bus_flags = bridge_state->output_bus_cfg.flags;
+
+	switch (bridge_state->output_bus_cfg.format) {
+	case MEDIA_BUS_FMT_RGB666_1X7X3_SPWG:
+		lvds_format_24bpp = false;
+		lvds_format_jeida = true;
+		break;
+	case MEDIA_BUS_FMT_RGB888_1X7X4_JEIDA:
+		lvds_format_24bpp = true;
+		lvds_format_jeida = true;
+		break;
+	case MEDIA_BUS_FMT_RGB888_1X7X4_SPWG:
+		lvds_format_24bpp = true;
+		lvds_format_jeida = false;
+		break;
+	default:
+		/*
+		 * Some bridges still don't set the correct
+		 * LVDS bus pixel format, use SPWG24 default
+		 * format until those are fixed.
+		 */
+		lvds_format_24bpp = true;
+		lvds_format_jeida = false;
+		dev_warn(ctx->dev,
+			 "Unsupported LVDS bus format 0x%04x, please check output bridge driver. Falling back to SPWG24.\n",
+			 bridge_state->output_bus_cfg.format);
+		break;
+	}
+
+	/*
+	 * Retrieve the CRTC adjusted mode. This requires a little dance to go
+	 * from the bridge to the encoder, to the connector and to the CRTC.
+	 */
+	connector = drm_atomic_get_new_connector_for_encoder(state,
+							     bridge->encoder);
+	crtc = drm_atomic_get_new_connector_state(state, connector)->crtc;
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	mode = &crtc_state->adjusted_mode;
+
+	ret = lt9211_read_chipid(ctx);
+	if (ret)
+		return;
+
+	if (ctx->chip_data->chip_type == LT9211C) {
+		drm_mode_copy(&ctx->lt9211c_mode, mode);
+		ctx->lt9211c_bpp24 = lvds_format_24bpp;
+		ctx->lt9211c_jeida = lvds_format_jeida;
+		ctx->lt9211c_de_high = !!(bus_flags & DRM_BUS_FLAG_DE_HIGH);
+		ctx->lt9211c_crtc = crtc;
+
+		/*
+		 * Needs a live DSI stream to auto-detect RX resolution/format;
+		 * defer bridge configuration until vblank inside the work item.
+		 */
+		queue_work(ctx->wq, &ctx->lt9211_work);
+		return;
+	}
+
+	ret = lt9211_system_init(ctx);
+	if (ret)
+		return;
+
+	ret = lt9211_configure_rx(ctx);
+	if (ret)
+		return;
+
+	ret = lt9211_autodetect_rx(ctx, mode);
+	if (ret)
+		return;
+
+	ret = lt9211_configure_timing(ctx, mode);
+	if (ret)
+		return;
+
+	ret = lt9211_configure_plls(ctx, mode);
+	if (ret)
+		return;
+
+	ret = lt9211_configure_tx(ctx, lvds_format_jeida, lvds_format_24bpp,
+				  bus_flags & DRM_BUS_FLAG_DE_HIGH);
+	if (ret)
+		return;
+
+	dev_dbg(ctx->dev, "LT9211 enabled.\n");
+}
+
+static void lt9211_atomic_disable(struct drm_bridge *bridge,
+				  struct drm_atomic_commit *state)
+{
+	struct lt9211 *ctx = bridge_to_lt9211(bridge);
+	int ret;
+
+	if (ctx->chip_data->chip_type == LT9211C)
+		cancel_work_sync(&ctx->lt9211_work);
+
+	/*
+	 * Put the chip in reset, pull nRST line low,
+	 * and assure lengthy 10ms reset low timing.
+	 */
+	gpiod_set_value(ctx->reset_gpio, 0);
+	usleep_range(10000, 11000);	/* Very long reset duration. */
+
+	ret = regulator_disable(ctx->vccio);
+	if (ret)
+		dev_err(ctx->dev, "Failed to disable vccio: %d\n", ret);
+
+	regcache_mark_dirty(ctx->regmap);
+}
+
+static enum drm_mode_status
+lt9211_mode_valid(struct drm_bridge *bridge,
+		  const struct drm_display_info *info,
+		  const struct drm_display_mode *mode)
+{
+	/* LVDS output clock range 25..176 MHz */
+	if (mode->clock < 25000)
+		return MODE_CLOCK_LOW;
+	if (mode->clock > 176000)
+		return MODE_CLOCK_HIGH;
+
+	return MODE_OK;
+}
+
+#define MAX_INPUT_SEL_FORMATS	1
+
+static u32 *
+lt9211_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
+				 struct drm_bridge_state *bridge_state,
+				 struct drm_crtc_state *crtc_state,
+				 struct drm_connector_state *conn_state,
+				 u32 output_fmt,
+				 unsigned int *num_input_fmts)
+{
+	u32 *input_fmts;
+
+	*num_input_fmts = 0;
+
+	input_fmts = kcalloc(MAX_INPUT_SEL_FORMATS, sizeof(*input_fmts),
+			     GFP_KERNEL);
+	if (!input_fmts)
+		return NULL;
+
+	/* This is the DSI-end bus format */
+	input_fmts[0] = MEDIA_BUS_FMT_RGB888_1X24;
+	*num_input_fmts = 1;
+
+	return input_fmts;
+}
+
+static const struct drm_bridge_funcs lt9211_funcs = {
+	.attach			= lt9211_attach,
+	.mode_valid		= lt9211_mode_valid,
+	.atomic_enable		= lt9211_atomic_enable,
+	.atomic_disable		= lt9211_atomic_disable,
+	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
+	.atomic_destroy_state	= drm_atomic_helper_bridge_destroy_state,
+	.atomic_get_input_bus_fmts = lt9211_atomic_get_input_bus_fmts,
+	.atomic_reset		= drm_atomic_helper_bridge_reset,
+};
+
+static int lt9211_parse_dt(struct lt9211 *ctx)
+{
+	struct device_node *port2, *port3;
+	struct drm_bridge *panel_bridge;
+	struct device *dev = ctx->dev;
+	struct drm_panel *panel;
+	int dual_link;
+	int ret;
+
+	ctx->vccio = devm_regulator_get(dev, "vccio");
+	if (IS_ERR(ctx->vccio))
+		return dev_err_probe(dev, PTR_ERR(ctx->vccio),
+				     "Failed to get supply 'vccio'\n");
+
+	ctx->lvds_dual_link = false;
+	ctx->lvds_dual_link_even_odd_swap = false;
+
+	port2 = of_graph_get_port_by_id(dev->of_node, 2);
+	port3 = of_graph_get_port_by_id(dev->of_node, 3);
+	dual_link = drm_of_lvds_get_dual_link_pixel_order(port2, port3);
+	of_node_put(port2);
+	of_node_put(port3);
+
+	if (dual_link == DRM_LVDS_DUAL_LINK_ODD_EVEN_PIXELS) {
+		ctx->lvds_dual_link = true;
+		/* Odd pixels to LVDS Channel A, even pixels to B */
+		ctx->lvds_dual_link_even_odd_swap = false;
+	} else if (dual_link == DRM_LVDS_DUAL_LINK_EVEN_ODD_PIXELS) {
+		ctx->lvds_dual_link = true;
+		/* Even pixels to LVDS Channel A, odd pixels to B */
+		ctx->lvds_dual_link_even_odd_swap = true;
+	}
+
+	ret = drm_of_find_panel_or_bridge(dev->of_node, 2, 0, &panel, &panel_bridge);
+	if (ret < 0)
+		return ret;
+	if (panel) {
+		panel_bridge = devm_drm_panel_bridge_add(dev, panel);
+		if (IS_ERR(panel_bridge))
+			return PTR_ERR(panel_bridge);
+	}
+
+	ctx->panel_bridge = panel_bridge;
+
+	return 0;
+}
+
+static int lt9211_host_attach(struct lt9211 *ctx)
+{
+	struct device *dev = ctx->dev;
+	struct device_node *host_node;
+	struct device_node *endpoint;
+	struct mipi_dsi_device_info info = {
+		.channel = 0,
+		.node = NULL,
+	};
+	struct mipi_dsi_device *dsi;
+	struct mipi_dsi_host *host;
+	int dsi_lanes;
+	int ret;
+
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, -1);
+	dsi_lanes = drm_of_get_data_lanes_count(endpoint, 1, 4);
+	host_node = of_graph_get_remote_port_parent(endpoint);
+	host = of_find_mipi_dsi_host_by_node(host_node);
+	of_node_put(host_node);
+	of_node_put(endpoint);
+
+	if (!host)
+		return -EPROBE_DEFER;
+
+	if (dsi_lanes < 0)
+		return dsi_lanes;
+
+	strscpy(info.type, ctx->chip_data->dsi_type, sizeof(info.type));
+	dsi = devm_mipi_dsi_device_register_full(dev, host, &info);
+	if (IS_ERR(dsi))
+		return dev_err_probe(dev, PTR_ERR(dsi),
+				     "failed to create dsi device\n");
+
+	ctx->dsi = dsi;
+
+	dsi->lanes = dsi_lanes;
+	dsi->format = MIPI_DSI_FMT_RGB888;
+	dsi->mode_flags = ctx->chip_data->dsi_mode_flags;
+
+	ret = devm_mipi_dsi_attach(dev, dsi);
+	if (ret < 0) {
+		dev_err(dev, "failed to attach dsi to host: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void lt9211_destroy_wq(void *data)
+{
+	destroy_workqueue(data);
+}
+
+static int lt9211_probe(struct i2c_client *client)
+{
+	struct device *dev = &client->dev;
+	struct lt9211 *ctx;
+	int ret;
+
+	ctx = devm_drm_bridge_alloc(dev, struct lt9211, bridge, &lt9211_funcs);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	ctx->dev = dev;
+
+	/*
+	 * Put the chip in reset, pull nRST line low,
+	 * and assure lengthy 10ms reset low timing.
+	 */
+	ctx->reset_gpio = devm_gpiod_get_optional(ctx->dev, "reset",
+						  GPIOD_OUT_LOW);
+	if (IS_ERR(ctx->reset_gpio))
+		return PTR_ERR(ctx->reset_gpio);
+
+	usleep_range(10000, 11000);	/* Very long reset duration. */
+
+	ret = lt9211_parse_dt(ctx);
+	if (ret)
+		return ret;
+
+	ctx->chip_data = i2c_get_match_data(client);
+	if (!ctx->chip_data)
+		return -ENODEV;
+
+	ctx->regmap = devm_regmap_init_i2c(client, ctx->chip_data->regmap_config);
+	if (IS_ERR(ctx->regmap))
+		return PTR_ERR(ctx->regmap);
+
+	ctx->bridge.of_node = dev->of_node;
+	ret = devm_drm_bridge_add(dev, &ctx->bridge);
+	if (ret)
+		return ret;
+
+	ret = lt9211_host_attach(ctx);
+	if (ret)
+		return ret;
+
+	if (ctx->chip_data->chip_type == LT9211C) {
+		ctx->wq = create_workqueue("lt9211_work");
+		if (!ctx->wq)
+			return -ENOMEM;
+		/* Register after DSI attach so devres flushes work before freeing ctx->dsi. */
+		ret = devm_add_action_or_reset(dev, lt9211_destroy_wq, ctx->wq);
+		if (ret)
+			return ret;
+		INIT_WORK(&ctx->lt9211_work, lt9211_work_func);
+	}
+
+	return 0;
 }
 
 static const struct i2c_device_id lt9211_id[] = {
-	{ "lontium,lt9211" },
-	{ "lontium,lt9211c" },
-	{},
+	{ .name = "lontium,lt9211", .driver_data = (kernel_ulong_t)&lt9211_chip_data },
+	{ .name = "lontium,lt9211c", .driver_data = (kernel_ulong_t)&lt9211c_chip_data },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, lt9211_id);
 
 static const struct of_device_id lt9211_match_table[] = {
-	{ .compatible = "lontium,lt9211" },
-	{ .compatible = "lontium,lt9211c" },
+	{ .compatible = "lontium,lt9211", .data = &lt9211_chip_data },
+	{ .compatible = "lontium,lt9211c", .data = &lt9211c_chip_data },
 	{},
 };
 MODULE_DEVICE_TABLE(of, lt9211_match_table);
 
 static struct i2c_driver lt9211_driver = {
 	.probe = lt9211_probe,
-	.remove = lt9211_remove,
 	.id_table = lt9211_id,
 	.driver = {
 		.name = "lt9211",
